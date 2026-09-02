@@ -1,93 +1,245 @@
-// Command scheduler runs one replica of the DistribuQ scheduler. Multiple
-// replicas form a cluster; exactly one becomes leader (via the raft
-// package) and accepts task submissions, while followers stand by to
-// take over if the leader crashes.
-package main
+// Package scheduler implements task queueing, worker registration, and
+// least-loaded task dispatch, plus failure detection that reassigns
+// in-flight tasks when a worker stops sending heartbeats.
+package scheduler
 
 import (
-	"flag"
-	"log"
-	"net"
-	"net/rpc"
-	"strings"
+	"errors"
+	"sync"
 	"time"
-
-	"github.com/TiyaGarg06/DistribuQ/internal/raft"
-	"github.com/TiyaGarg06/DistribuQ/internal/scheduler"
 )
 
-func main() {
-	id := flag.String("id", "", "unique ID for this scheduler replica")
-	addr := flag.String("addr", ":8000", "address to listen on for RPC")
-	peersFlag := flag.String("peers", "", "comma-separated id=addr pairs for other scheduler replicas")
-	flag.Parse()
+type TaskStatus string
 
-	if *id == "" {
-		log.Fatal("scheduler: -id is required")
-	}
+const (
+	TaskQueued    TaskStatus = "queued"
+	TaskAssigned  TaskStatus = "assigned"
+	TaskRunning   TaskStatus = "running"
+	TaskCompleted TaskStatus = "completed"
+	TaskFailed    TaskStatus = "failed"
+)
 
-	peerAddrs := parsePeers(*peersFlag)
-	var peerIDs []string
-	for pid := range peerAddrs {
-		peerIDs = append(peerIDs, pid)
-	}
-
-	dispatch := func(workerID, workerAddr string, task *scheduler.Task) error {
-		client, err := rpc.Dial("tcp", workerAddr)
-		if err != nil {
-			return err
-		}
-		defer client.Close()
-
-		args := struct {
-			TaskID  string
-			Payload string
-		}{TaskID: task.ID, Payload: task.Payload}
-		var reply struct{ Accepted bool }
-		return client.Call("WorkerService.ExecuteTask", &args, &reply)
-	}
-
-	sched := scheduler.NewScheduler(dispatch)
-	go sched.MonitorWorkers(500 * time.Millisecond)
-
-	transport := raft.NewRPCTransport(peerAddrs)
-	node := raft.NewNode(*id, peerIDs, transport)
-	node.OnBecomeLeader(func() {
-		log.Printf("[%s] elected LEADER (term %d) -- now accepting task submissions", *id, node.Term())
-	})
-	node.OnBecomeFollower(func() {
-		log.Printf("[%s] stepped down to FOLLOWER (leader is %q)", *id, node.LeaderID())
-	})
-
-	server := rpc.NewServer()
-	if err := server.RegisterName("RaftService", &raft.RaftService{Node: node}); err != nil {
-		log.Fatalf("failed to register RaftService: %v", err)
-	}
-	if err := server.RegisterName("SchedulerService", &scheduler.SchedulerService{S: sched}); err != nil {
-		log.Fatalf("failed to register SchedulerService: %v", err)
-	}
-
-	listener, err := net.Listen("tcp", *addr)
-	if err != nil {
-		log.Fatalf("failed to listen on %s: %v", *addr, err)
-	}
-	log.Printf("[%s] scheduler replica listening on %s", *id, *addr)
-
-	go node.Run()
-	server.Accept(listener)
+type Task struct {
+	ID         string
+	Payload    string
+	Status     TaskStatus
+	WorkerID   string
+	Attempts   int
+	MaxRetries int
 }
 
-func parsePeers(s string) map[string]string {
-	peers := make(map[string]string)
-	if s == "" {
-		return peers
+type WorkerInfo struct {
+	ID            string
+	Addr          string
+	LastHeartbeat time.Time
+	ActiveTasks   map[string]bool
+}
+
+var (
+	ErrNoWorkersAvailable = errors.New("scheduler: no healthy workers available")
+	ErrTaskNotFound       = errors.New("scheduler: task not found")
+)
+
+// WorkerTimeout is how long a worker can go without a heartbeat before
+// it's considered dead and its in-flight tasks are reassigned.
+// It's a var (not const) so tests can shrink it instead of sleeping
+// for the full production timeout.
+var WorkerTimeout = 3 * time.Second
+
+type Scheduler struct {
+	mu sync.Mutex
+
+	tasks   map[string]*Task
+	workers map[string]*WorkerInfo
+
+	// dispatchFn sends a task to a worker; injected so it can be swapped
+	// (RPC today, gRPC later) without touching scheduling logic.
+	dispatchFn func(workerID, addr string, task *Task) error
+
+	stopCh chan struct{}
+}
+
+func NewScheduler(dispatchFn func(workerID, addr string, task *Task) error) *Scheduler {
+	return &Scheduler{
+		tasks:      make(map[string]*Task),
+		workers:    make(map[string]*WorkerInfo),
+		dispatchFn: dispatchFn,
+		stopCh:     make(chan struct{}),
 	}
-	for _, pair := range strings.Split(s, ",") {
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) != 2 {
+}
+
+// RegisterWorker adds (or refreshes) a worker in the pool.
+func (s *Scheduler) RegisterWorker(id, addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if w, ok := s.workers[id]; ok {
+		w.LastHeartbeat = time.Now()
+		w.Addr = addr
+		return
+	}
+	s.workers[id] = &WorkerInfo{
+		ID:            id,
+		Addr:          addr,
+		LastHeartbeat: time.Now(),
+		ActiveTasks:   make(map[string]bool),
+	}
+}
+
+// Heartbeat refreshes a worker's liveness timestamp.
+func (s *Scheduler) Heartbeat(workerID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w, ok := s.workers[workerID]; ok {
+		w.LastHeartbeat = time.Now()
+	}
+}
+
+// SubmitTask queues a task and attempts immediate dispatch to the
+// least-loaded healthy worker.
+func (s *Scheduler) SubmitTask(id, payload string) *Task {
+	s.mu.Lock()
+	task := &Task{ID: id, Payload: payload, Status: TaskQueued, MaxRetries: 3}
+	s.tasks[id] = task
+	s.mu.Unlock()
+
+	_ = s.dispatch(task)
+	return task
+}
+
+// dispatch picks the least-loaded worker and hands the task to it. If
+// dispatchFn fails, the tentative assignment is rolled back and the
+// task is requeued (or marked failed past MaxRetries) so it never gets
+// stuck as TaskAssigned on a worker that never actually received it.
+func (s *Scheduler) dispatch(task *Task) error {
+	s.mu.Lock()
+	worker := s.pickLeastLoadedWorkerLocked()
+	if worker == nil {
+		s.mu.Unlock()
+		return ErrNoWorkersAvailable
+	}
+	task.Status = TaskAssigned
+	task.WorkerID = worker.ID
+	task.Attempts++
+	worker.ActiveTasks[task.ID] = true
+	addr := worker.Addr
+	workerID := worker.ID
+	s.mu.Unlock()
+
+	if err := s.dispatchFn(workerID, addr, task); err != nil {
+		s.mu.Lock()
+		if w, ok := s.workers[workerID]; ok {
+			delete(w.ActiveTasks, task.ID)
+		}
+		if task.Attempts < task.MaxRetries {
+			task.Status = TaskQueued
+			task.WorkerID = ""
+		} else {
+			task.Status = TaskFailed
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Scheduler) pickLeastLoadedWorkerLocked() *WorkerInfo {
+	var best *WorkerInfo
+	now := time.Now()
+	for _, w := range s.workers {
+		if now.Sub(w.LastHeartbeat) > WorkerTimeout {
+			continue // treat as dead, skip
+		}
+		if best == nil || len(w.ActiveTasks) < len(best.ActiveTasks) {
+			best = w
+		}
+	}
+	return best
+}
+
+// CompleteTask marks a task finished and frees the worker's slot.
+func (s *Scheduler) CompleteTask(taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	task.Status = TaskCompleted
+	if w, ok := s.workers[task.WorkerID]; ok {
+		delete(w.ActiveTasks, taskID)
+	}
+	return nil
+}
+
+// MonitorWorkers should run in a goroutine. It periodically checks for
+// workers that have gone silent past WorkerTimeout, marks them dead,
+// and reassigns their in-flight tasks to healthy workers -- this is
+// the core fault-recovery behavior of the system.
+func (s *Scheduler) MonitorWorkers(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.reapDeadWorkers()
+		}
+	}
+}
+
+func (s *Scheduler) Stop() {
+	close(s.stopCh)
+}
+
+func (s *Scheduler) reapDeadWorkers() {
+	now := time.Now()
+
+	var orphaned []*Task
+	s.mu.Lock()
+	for id, w := range s.workers {
+		if now.Sub(w.LastHeartbeat) <= WorkerTimeout {
 			continue
 		}
-		peers[parts[0]] = parts[1]
+		// Worker is dead: collect its in-flight tasks for reassignment.
+		for taskID := range w.ActiveTasks {
+			if t, ok := s.tasks[taskID]; ok && t.Status != TaskCompleted {
+				orphaned = append(orphaned, t)
+			}
+		}
+		delete(s.workers, id)
 	}
-	return peers
+	s.mu.Unlock()
+
+	for _, t := range orphaned {
+		s.mu.Lock()
+		t.Status = TaskQueued
+		t.WorkerID = ""
+		requeue := t.Attempts < t.MaxRetries
+		s.mu.Unlock()
+
+		if requeue {
+			s.dispatch(t)
+		} else {
+			s.mu.Lock()
+			t.Status = TaskFailed
+			s.mu.Unlock()
+		}
+	}
+}
+
+// Snapshot returns a copy of current task states, useful for tests and
+// for the dashboard/CLI to display cluster state.
+func (s *Scheduler) Snapshot() (tasks map[string]TaskStatus, workerCount int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tasks = make(map[string]TaskStatus, len(s.tasks))
+	for id, t := range s.tasks {
+		tasks[id] = t.Status
+	}
+	return tasks, len(s.workers)
 }
