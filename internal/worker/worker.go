@@ -43,6 +43,9 @@ func (ws *WorkerService) ExecuteTask(args *ExecuteArgs, reply *ExecuteReply) err
 	go func() {
 		if err := ws.w.Execute(args.TaskID, args.Payload); err != nil {
 			log.Printf("worker %s: task %s failed: %v", ws.w.ID, args.TaskID, err)
+			if rerr := ws.w.reportFailure(args.TaskID, err); rerr != nil {
+				log.Printf("worker %s: failed to report failure for %s: %v", ws.w.ID, args.TaskID, rerr)
+			}
 			return
 		}
 		if err := ws.w.reportCompletion(args.TaskID); err != nil {
@@ -68,6 +71,27 @@ func (w *Worker) reportCompletion(taskID string) error {
 type CompleteArgs struct {
 	TaskID   string
 	WorkerID string
+}
+
+// reportFailure calls back into the scheduler's RPC service to report
+// that this task's execution failed, so the scheduler can requeue it
+// (or mark it permanently failed) instead of leaving it stuck as
+// assigned to this worker forever.
+func (w *Worker) reportFailure(taskID string, cause error) error {
+	client, err := rpc.Dial("tcp", w.SchedulerAddr)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	var reply struct{ OK bool }
+	return client.Call("SchedulerService.FailTask", &FailArgs{TaskID: taskID, WorkerID: w.ID, Cause: cause.Error()}, &reply)
+}
+
+type FailArgs struct {
+	TaskID   string
+	WorkerID string
+	Cause    string
 }
 
 // StartHeartbeatLoop periodically pings the scheduler so it knows this
