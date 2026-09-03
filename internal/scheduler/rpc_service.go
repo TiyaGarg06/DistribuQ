@@ -41,6 +41,21 @@ func (s *SchedulerService) CompleteTask(args *CompleteArgs, reply *OKReply) erro
 	return err
 }
 
+// FailArgs carries the reason a worker gives for reporting a task as
+// failed. Cause is informational only (logged), not parsed by the
+// scheduler.
+type FailArgs struct {
+	TaskID   string
+	WorkerID string
+	Cause    string
+}
+
+func (s *SchedulerService) FailTask(args *FailArgs, reply *OKReply) error {
+	err := s.S.FailTask(args.TaskID)
+	reply.OK = err == nil
+	return err
+}
+
 type SubmitArgs struct {
 	TaskID  string
 	Payload string
