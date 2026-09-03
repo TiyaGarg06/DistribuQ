@@ -103,11 +103,14 @@ func (s *Scheduler) SubmitTask(id, payload string) *Task {
 	s.tasks[id] = task
 	s.mu.Unlock()
 
-	s.dispatch(task)
+	_ = s.dispatch(task)
 	return task
 }
 
-// dispatch picks the least-loaded worker and hands the task to it.
+// dispatch picks the least-loaded worker and hands the task to it. If
+// dispatchFn fails, the tentative assignment is rolled back and the
+// task is requeued (or marked failed past MaxRetries) so it never gets
+// stuck as TaskAssigned on a worker that never actually received it.
 func (s *Scheduler) dispatch(task *Task) error {
 	s.mu.Lock()
 	worker := s.pickLeastLoadedWorkerLocked()
@@ -123,7 +126,31 @@ func (s *Scheduler) dispatch(task *Task) error {
 	workerID := worker.ID
 	s.mu.Unlock()
 
-	return s.dispatchFn(workerID, addr, task)
+	if err := s.dispatchFn(workerID, addr, task); err != nil {
+		s.mu.Lock()
+		if w, ok := s.workers[workerID]; ok {
+			delete(w.ActiveTasks, task.ID)
+		}
+		s.requeueOrFailLocked(task)
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// requeueOrFailLocked decides a task's fate after it comes off a
+// worker without completing (dispatch failure, execution failure, or
+// worker death): retry it if attempts remain, otherwise mark it
+// permanently failed. Callers must hold s.mu and must have already
+// cleared the task out of its former worker's ActiveTasks.
+func (s *Scheduler) requeueOrFailLocked(task *Task) {
+	if task.Attempts < task.MaxRetries {
+		task.Status = TaskQueued
+		task.WorkerID = ""
+	} else {
+		task.Status = TaskFailed
+		task.WorkerID = ""
+	}
 }
 
 func (s *Scheduler) pickLeastLoadedWorkerLocked() *WorkerInfo {
@@ -153,6 +180,29 @@ func (s *Scheduler) CompleteTask(taskID string) error {
 	if w, ok := s.workers[task.WorkerID]; ok {
 		delete(w.ActiveTasks, taskID)
 	}
+	return nil
+}
+
+// FailTask is called when a worker reports that a task's execution
+// failed (as opposed to a dispatch-time failure, handled in dispatch,
+// or a worker going silent, handled in reapDeadWorkers). It frees the
+// worker's slot and requeues the task for retry, or marks it
+// permanently failed once MaxRetries is exhausted. Without this path,
+// an execution failure on an otherwise-healthy worker would leave the
+// task stuck as TaskAssigned forever, since nothing else would ever
+// notice or reassign it.
+func (s *Scheduler) FailTask(taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	if w, ok := s.workers[task.WorkerID]; ok {
+		delete(w.ActiveTasks, taskID)
+	}
+	s.requeueOrFailLocked(task)
 	return nil
 }
 
