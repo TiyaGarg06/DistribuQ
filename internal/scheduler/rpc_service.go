@@ -1,10 +1,27 @@
 package scheduler
 
+import "errors"
+
+// ErrNotLeader is returned by SchedulerService RPC methods that
+// require leadership (currently SubmitTask) when this replica is not
+// the current Raft leader. Callers (e.g. cmd/submit) can use this to
+// detect a misdirected request and retry against the real leader.
+var ErrNotLeader = errors.New("scheduler: this replica is not the leader")
+
 // SchedulerService is the RPC-exported wrapper around a Scheduler,
-// registered on the leader's rpc.Server so workers can register,
-// heartbeat, and report task completion over the network.
+// registered on every scheduler replica so workers can register,
+// heartbeat, and report task completion over the network. IsLeader
+// gates the operations (currently just SubmitTask) that must only be
+// accepted by the current Raft leader -- without it, a client pointed
+// at a follower would have that follower independently track and
+// dispatch tasks against the shared worker pool.
 type SchedulerService struct {
-	S *Scheduler
+	S        *Scheduler
+	IsLeader func() bool
+}
+
+func (s *SchedulerService) requireLeader() bool {
+	return s.IsLeader == nil || s.IsLeader()
 }
 
 type RegisterArgs struct {
@@ -62,6 +79,10 @@ type SubmitArgs struct {
 }
 
 func (s *SchedulerService) SubmitTask(args *SubmitArgs, reply *OKReply) error {
+	if !s.requireLeader() {
+		reply.OK = false
+		return ErrNotLeader
+	}
 	s.S.SubmitTask(args.TaskID, args.Payload)
 	reply.OK = true
 	return nil
