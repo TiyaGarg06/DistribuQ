@@ -245,6 +245,7 @@ func (n *Node) sendHeartbeats() {
 				n.currentTerm = reply.Term
 				n.state = Follower
 				n.leaderID = ""
+				n.electionResetAt = time.Now()
 				n.mu.Unlock()
 				if n.onBecomeFollower != nil {
 					n.onBecomeFollower()
