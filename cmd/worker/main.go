@@ -1,6 +1,7 @@
 // Command worker runs a single worker node: it registers itself with
 // the scheduler, sends periodic heartbeats, and executes tasks pushed
-// to it over RPC.
+// to it over RPC. Each task's payload is run as a shell command (see
+// internal/worker.NewShellExecutor).
 package main
 
 import (
@@ -17,6 +18,7 @@ func main() {
 	id := flag.String("id", "", "unique ID for this worker")
 	addr := flag.String("addr", ":9000", "address to listen on for RPC")
 	schedulerAddr := flag.String("scheduler", "localhost:8000", "address of the scheduler leader")
+	timeout := flag.Duration("timeout", worker.DefaultExecTimeout, "max duration a single task's command may run before being killed")
 	flag.Parse()
 
 	if *id == "" {
@@ -26,15 +28,7 @@ func main() {
 	w := &worker.Worker{
 		ID:            *id,
 		SchedulerAddr: *schedulerAddr,
-		Execute: func(taskID, payload string) error {
-			// Placeholder task execution -- real task logic (e.g.
-			// running a job, processing a batch) goes here. Simulated
-			// work delay stands in for now.
-			log.Printf("[%s] executing task %s (payload=%q)", *id, taskID, payload)
-			time.Sleep(200 * time.Millisecond)
-			log.Printf("[%s] finished task %s", *id, taskID)
-			return nil
-		},
+		Execute:       worker.NewShellExecutor(*id, *timeout),
 	}
 
 	server := rpc.NewServer()
