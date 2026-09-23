@@ -109,8 +109,12 @@ func (s *Scheduler) SubmitTask(id, payload string) *Task {
 
 // dispatch picks the least-loaded worker and hands the task to it. If
 // dispatchFn fails, the tentative assignment is rolled back and the
-// task is requeued (or marked failed past MaxRetries) so it never gets
-// stuck as TaskAssigned on a worker that never actually received it.
+// task is requeued (or marked failed past MaxRetries); if requeued,
+// dispatch immediately retries against a different worker rather than
+// leaving the task sitting as TaskQueued with nothing to ever pick it
+// back up. Retries are naturally bounded: each attempt increments
+// task.Attempts, and once Attempts reaches MaxRetries the task is
+// marked TaskFailed instead of requeued, which stops the recursion.
 func (s *Scheduler) dispatch(task *Task) error {
 	s.mu.Lock()
 	worker := s.pickLeastLoadedWorkerLocked()
@@ -132,7 +136,12 @@ func (s *Scheduler) dispatch(task *Task) error {
 			delete(w.ActiveTasks, task.ID)
 		}
 		s.requeueOrFailLocked(task)
+		requeued := task.Status == TaskQueued
 		s.mu.Unlock()
+
+		if requeued {
+			s.dispatch(task)
+		}
 		return err
 	}
 	return nil
@@ -186,23 +195,29 @@ func (s *Scheduler) CompleteTask(taskID string) error {
 // FailTask is called when a worker reports that a task's execution
 // failed (as opposed to a dispatch-time failure, handled in dispatch,
 // or a worker going silent, handled in reapDeadWorkers). It frees the
-// worker's slot and requeues the task for retry, or marks it
-// permanently failed once MaxRetries is exhausted. Without this path,
-// an execution failure on an otherwise-healthy worker would leave the
-// task stuck as TaskAssigned forever, since nothing else would ever
-// notice or reassign it.
+// worker's slot and, if attempts remain, requeues the task and
+// immediately attempts redispatch to a different worker (mirroring
+// reapDeadWorkers); once MaxRetries is exhausted it's marked
+// permanently failed instead. Without the redispatch step, a requeued
+// task would sit as TaskQueued forever, since nothing else
+// periodically retries queued tasks.
 func (s *Scheduler) FailTask(taskID string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	task, ok := s.tasks[taskID]
 	if !ok {
+		s.mu.Unlock()
 		return ErrTaskNotFound
 	}
 	if w, ok := s.workers[task.WorkerID]; ok {
 		delete(w.ActiveTasks, taskID)
 	}
 	s.requeueOrFailLocked(task)
+	requeued := task.Status == TaskQueued
+	s.mu.Unlock()
+
+	if requeued {
+		s.dispatch(task)
+	}
 	return nil
 }
 
