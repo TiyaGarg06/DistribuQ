@@ -87,3 +87,26 @@ func (s *SchedulerService) SubmitTask(args *SubmitArgs, reply *OKReply) error {
 	reply.OK = true
 	return nil
 }
+
+// StatusArgs is empty -- GetStatus takes no parameters, it just
+// reports this replica's current local view of the world.
+type StatusArgs struct{}
+
+// StatusReply mirrors Scheduler.Snapshot()'s return values so they
+// can cross the RPC boundary.
+type StatusReply struct {
+	Tasks       map[string]TaskStatus
+	WorkerCount int
+}
+
+// GetStatus reports this replica's local task states and worker
+// count. Available on every replica, not just the leader: a follower
+// answering truthfully about its own (possibly stale, since there's
+// no real log replication yet) state is still useful for confirming
+// it's alive and roughly caught up.
+func (s *SchedulerService) GetStatus(args *StatusArgs, reply *StatusReply) error {
+	tasks, workerCount := s.S.Snapshot()
+	reply.Tasks = tasks
+	reply.WorkerCount = workerCount
+	return nil
+}
