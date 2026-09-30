@@ -186,6 +186,110 @@ func TestFailTaskRetriesThenFails(t *testing.T) {
 	}
 }
 
+// taskWorker returns the ID of the worker a task is currently
+// assigned to ("" if none).
+func taskWorker(s *Scheduler, id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tasks[id].WorkerID
+}
+
+// newReassignedTask builds the classic stale-report scenario: task t1
+// is dispatched to w1, w1 then goes silent and is reaped, and t1 is
+// redispatched to w2. From here on, w1 is a "zombie": it may still
+// report on t1, but t1 now belongs to w2.
+func newReassignedTask(t *testing.T) (*Scheduler, *fakeDispatch) {
+	t.Helper()
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+
+	s.RegisterWorker("w1", "localhost:9001")
+	s.SubmitTask("t1", "payload")
+	s.RegisterWorker("w2", "localhost:9002")
+
+	// Make w1 look like it stopped heartbeating long ago, then reap it.
+	s.mu.Lock()
+	s.workers["w1"].LastHeartbeat = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+	s.reapDeadWorkers()
+
+	status, attempts := taskState(s, "t1")
+	if status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w2" {
+		t.Fatalf("setup: expected t1 reassigned to w2 (attempt 2), got %s on %q (attempt %d)",
+			status, taskWorker(s, "t1"), attempts)
+	}
+	return s, fd
+}
+
+// TestStaleCompleteIsRejected checks that a completion report from a
+// worker that no longer owns the task is ignored, and that the real
+// owner can still complete it.
+func TestStaleCompleteIsRejected(t *testing.T) {
+	s, _ := newReassignedTask(t)
+
+	err := s.CompleteTaskBy("t1", "w1")
+	if !errors.Is(err, ErrStaleReport) {
+		t.Fatalf("expected ErrStaleReport from zombie worker, got %v", err)
+	}
+	status, _ := taskState(s, "t1")
+	if status != TaskAssigned || taskWorker(s, "t1") != "w2" {
+		t.Errorf("stale completion must not change task state, got %s on %q", status, taskWorker(s, "t1"))
+	}
+
+	if err := s.CompleteTaskBy("t1", "w2"); err != nil {
+		t.Fatalf("current assignee should be able to complete the task, got %v", err)
+	}
+	if status, _ := taskState(s, "t1"); status != TaskCompleted {
+		t.Errorf("expected task completed, got %s", status)
+	}
+	if n := activeTaskCount(s, "w2"); n != 0 {
+		t.Errorf("expected w2 to have 0 active tasks after completing, got %d", n)
+	}
+}
+
+// TestStaleFailIsRejected checks that a failure report from a worker
+// that no longer owns the task does not burn a retry or trigger a
+// spurious redispatch.
+func TestStaleFailIsRejected(t *testing.T) {
+	s, fd := newReassignedTask(t)
+	dispatchesBefore := len(fd.log)
+
+	err := s.FailTaskBy("t1", "w1")
+	if !errors.Is(err, ErrStaleReport) {
+		t.Fatalf("expected ErrStaleReport from zombie worker, got %v", err)
+	}
+	status, attempts := taskState(s, "t1")
+	if status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w2" {
+		t.Errorf("stale failure must not change task state, got %s on %q (attempt %d)",
+			status, taskWorker(s, "t1"), attempts)
+	}
+	if len(fd.log) != dispatchesBefore {
+		t.Errorf("stale failure must not trigger a redispatch, got %d extra dispatch(es)", len(fd.log)-dispatchesBefore)
+	}
+
+	// The real owner reporting failure still requeues and redispatches.
+	if err := s.FailTaskBy("t1", "w2"); err != nil {
+		t.Fatalf("current assignee failure report should be accepted, got %v", err)
+	}
+	if _, attempts := taskState(s, "t1"); attempts != 3 {
+		t.Errorf("expected owner's failure to trigger attempt 3, got attempt %d", attempts)
+	}
+}
+
+// TestReportsForUnknownTask checks that reporting on a task the
+// scheduler has never seen returns ErrTaskNotFound rather than
+// ErrStaleReport or a panic.
+func TestReportsForUnknownTask(t *testing.T) {
+	s := NewScheduler((&fakeDispatch{}).fn)
+
+	if err := s.CompleteTaskBy("nope", "w1"); !errors.Is(err, ErrTaskNotFound) {
+		t.Errorf("CompleteTaskBy: expected ErrTaskNotFound, got %v", err)
+	}
+	if err := s.FailTaskBy("nope", "w1"); !errors.Is(err, ErrTaskNotFound) {
+		t.Errorf("FailTaskBy: expected ErrTaskNotFound, got %v", err)
+	}
+}
+
 func taskID(i int) string {
 	return "t" + string(rune('0'+i))
 }
