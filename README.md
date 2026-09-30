@@ -8,7 +8,7 @@ Zero external dependencies: standard library only.
 
 ```
                  ┌────────────┐   RequestVote / Heartbeat   ┌────────────┐
-   submit ─────▶ │ scheduler  │ ◀─────────────────────────▶ │ scheduler  │
+   submit ─────▶ │ scheduler  │ ◀───────────────────────▶ │ scheduler  │
    (client)      │  (leader)  │                             │ (follower) │
                  └─────┬──────┘                             └────────────┘
           dispatch     │  ▲ register / heartbeat /
