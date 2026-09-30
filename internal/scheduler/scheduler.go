@@ -38,6 +38,13 @@ type WorkerInfo struct {
 var (
 	ErrNoWorkersAvailable = errors.New("scheduler: no healthy workers available")
 	ErrTaskNotFound       = errors.New("scheduler: task not found")
+
+	// ErrStaleReport is returned when a worker reports the outcome of a
+	// task that is no longer assigned to it (for example, the worker was
+	// declared dead, the task was reassigned, and then the old worker
+	// woke up and reported late). The report is ignored so it can't
+	// clobber the state of the task's current assignment.
+	ErrStaleReport = errors.New("scheduler: stale report from a worker the task is not assigned to")
 )
 
 // WorkerTimeout is how long a worker can go without a heartbeat before
@@ -176,14 +183,33 @@ func (s *Scheduler) pickLeastLoadedWorkerLocked() *WorkerInfo {
 	return best
 }
 
-// CompleteTask marks a task finished and frees the worker's slot.
+// CompleteTask marks a task finished and frees the worker's slot. It
+// accepts the report regardless of which worker sent it; prefer
+// CompleteTaskBy, which rejects stale reports.
 func (s *Scheduler) CompleteTask(taskID string) error {
+	return s.completeTask(taskID, "", false)
+}
+
+// CompleteTaskBy marks a task finished, but only if workerID is the
+// worker the task is currently assigned to. A report from any other
+// worker (e.g. one that was declared dead and whose task has since
+// been reassigned) is ignored and ErrStaleReport is returned. A
+// duplicate report from the current assignee for an already-completed
+// task is treated as a harmless no-op.
+func (s *Scheduler) CompleteTaskBy(taskID, workerID string) error {
+	return s.completeTask(taskID, workerID, true)
+}
+
+func (s *Scheduler) completeTask(taskID, workerID string, checkWorker bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	task, ok := s.tasks[taskID]
 	if !ok {
 		return ErrTaskNotFound
+	}
+	if checkWorker && task.WorkerID != workerID {
+		return ErrStaleReport
 	}
 	task.Status = TaskCompleted
 	if w, ok := s.workers[task.WorkerID]; ok {
@@ -201,12 +227,30 @@ func (s *Scheduler) CompleteTask(taskID string) error {
 // permanently failed instead. Without the redispatch step, a requeued
 // task would sit as TaskQueued forever, since nothing else
 // periodically retries queued tasks.
+//
+// It accepts the report regardless of which worker sent it; prefer
+// FailTaskBy, which rejects stale reports.
 func (s *Scheduler) FailTask(taskID string) error {
+	return s.failTask(taskID, "", false)
+}
+
+// FailTaskBy is FailTask restricted to the worker the task is
+// currently assigned to. Reports from any other worker return
+// ErrStaleReport and change nothing.
+func (s *Scheduler) FailTaskBy(taskID, workerID string) error {
+	return s.failTask(taskID, workerID, true)
+}
+
+func (s *Scheduler) failTask(taskID, workerID string, checkWorker bool) error {
 	s.mu.Lock()
 	task, ok := s.tasks[taskID]
 	if !ok {
 		s.mu.Unlock()
 		return ErrTaskNotFound
+	}
+	if checkWorker && task.WorkerID != workerID {
+		s.mu.Unlock()
+		return ErrStaleReport
 	}
 	if w, ok := s.workers[task.WorkerID]; ok {
 		delete(w.ActiveTasks, taskID)
