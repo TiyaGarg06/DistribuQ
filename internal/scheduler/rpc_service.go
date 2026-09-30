@@ -52,8 +52,12 @@ type CompleteArgs struct {
 	WorkerID string
 }
 
+// CompleteTask records a worker's report that a task finished. The
+// report is only accepted if args.WorkerID is the worker the task is
+// currently assigned to; a late report from a worker whose task was
+// already reassigned is rejected with ErrStaleReport.
 func (s *SchedulerService) CompleteTask(args *CompleteArgs, reply *OKReply) error {
-	err := s.S.CompleteTask(args.TaskID)
+	err := s.S.CompleteTaskBy(args.TaskID, args.WorkerID)
 	reply.OK = err == nil
 	return err
 }
@@ -67,8 +71,10 @@ type FailArgs struct {
 	Cause    string
 }
 
+// FailTask records a worker's report that a task's execution failed,
+// with the same stale-report protection as CompleteTask.
 func (s *SchedulerService) FailTask(args *FailArgs, reply *OKReply) error {
-	err := s.S.FailTask(args.TaskID)
+	err := s.S.FailTaskBy(args.TaskID, args.WorkerID)
 	reply.OK = err == nil
 	return err
 }
