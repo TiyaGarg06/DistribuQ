@@ -73,7 +73,12 @@ type Scheduler struct {
 	// (RPC today, gRPC later) without touching scheduling logic.
 	dispatchFn func(workerID, addr string, task *Task) error
 
-	stopCh chan struct{}
+	// stopCh is closed by Stop to end MonitorWorkers. stopOnce makes
+	// Stop idempotent: closing an already-closed channel panics, and
+	// shutdown paths (signal handlers, deferred cleanup, tests) can
+	// easily end up calling Stop more than once.
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 func NewScheduler(dispatchFn func(workerID, addr string, task *Task) error) *Scheduler {
@@ -303,8 +308,12 @@ func (s *Scheduler) MonitorWorkers(interval time.Duration) {
 	}
 }
 
+// Stop ends MonitorWorkers. It is safe to call more than once and from
+// multiple goroutines; only the first call has any effect.
 func (s *Scheduler) Stop() {
-	close(s.stopCh)
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 }
 
 func (s *Scheduler) reapDeadWorkers() {
