@@ -56,7 +56,10 @@ func TestNoWorkersAvailable(t *testing.T) {
 	fd := &fakeDispatch{}
 	s := NewScheduler(fd.fn)
 
-	task := s.SubmitTask("t1", "payload")
+	task, err := s.SubmitTask("t1", "payload")
+	if err != nil {
+		t.Fatalf("SubmitTask: %v", err)
+	}
 	if task.Status != TaskQueued {
 		t.Errorf("expected task to remain queued with no workers, got %s", task.Status)
 	}
@@ -67,7 +70,10 @@ func TestDeadWorkerTasksAreReassigned(t *testing.T) {
 	s := NewScheduler(fd.fn)
 
 	s.RegisterWorker("w1", "localhost:9001")
-	task := s.SubmitTask("t1", "payload")
+	task, err := s.SubmitTask("t1", "payload")
+	if err != nil {
+		t.Fatalf("SubmitTask: %v", err)
+	}
 
 	if task.WorkerID != "w1" {
 		t.Fatalf("expected task assigned to w1, got %q", task.WorkerID)
@@ -287,6 +293,118 @@ func TestReportsForUnknownTask(t *testing.T) {
 	}
 	if err := s.FailTaskBy("nope", "w1"); !errors.Is(err, ErrTaskNotFound) {
 		t.Errorf("FailTaskBy: expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+// TestSubmitRejectsDuplicateID checks that resubmitting an existing
+// task ID is rejected and leaves the original task (still in flight on
+// a worker) completely untouched, and that IDs stay reserved even after
+// the task has completed.
+func TestSubmitRejectsDuplicateID(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+	s.RegisterWorker("w1", "localhost:9001")
+
+	if _, err := s.SubmitTask("t1", "original"); err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+
+	task, err := s.SubmitTask("t1", "overwrite attempt")
+	if !errors.Is(err, ErrDuplicateTask) {
+		t.Fatalf("expected ErrDuplicateTask, got %v", err)
+	}
+	if task != nil {
+		t.Errorf("expected nil task on rejected submit, got %+v", task)
+	}
+
+	s.mu.Lock()
+	payload := s.tasks["t1"].Payload
+	s.mu.Unlock()
+	if payload != "original" {
+		t.Errorf("duplicate submit overwrote the payload: got %q", payload)
+	}
+	status, attempts := taskState(s, "t1")
+	if status != TaskAssigned || attempts != 1 {
+		t.Errorf("duplicate submit disturbed the running task: %s, attempt %d", status, attempts)
+	}
+	if len(fd.log) != 1 {
+		t.Errorf("duplicate submit must not dispatch again, got %d dispatches", len(fd.log))
+	}
+
+	// The ID stays reserved after completion.
+	if err := s.CompleteTask("t1"); err != nil {
+		t.Fatalf("CompleteTask: %v", err)
+	}
+	if _, err := s.SubmitTask("t1", "again"); !errors.Is(err, ErrDuplicateTask) {
+		t.Errorf("expected ErrDuplicateTask for a completed task's id, got %v", err)
+	}
+}
+
+// TestSubmitRejectsEmptyID checks that an empty task ID is rejected and
+// nothing is queued.
+func TestSubmitRejectsEmptyID(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+	s.RegisterWorker("w1", "localhost:9001")
+
+	task, err := s.SubmitTask("", "payload")
+	if !errors.Is(err, ErrEmptyTaskID) {
+		t.Fatalf("expected ErrEmptyTaskID, got %v", err)
+	}
+	if task != nil {
+		t.Errorf("expected nil task on rejected submit, got %+v", task)
+	}
+	if tasks, _ := s.Snapshot(); len(tasks) != 0 {
+		t.Errorf("expected no tasks to be queued, got %d", len(tasks))
+	}
+	if len(fd.log) != 0 {
+		t.Errorf("expected no dispatches, got %d", len(fd.log))
+	}
+}
+
+// TestStopIsIdempotent checks that Stop can be called repeatedly
+// without panicking (closing a closed channel would), that it ends a
+// running MonitorWorkers loop, and that a monitor started after Stop
+// returns immediately instead of hanging.
+func TestStopIsIdempotent(t *testing.T) {
+	s := NewScheduler((&fakeDispatch{}).fn)
+
+	done := make(chan struct{})
+	go func() {
+		s.MonitorWorkers(10 * time.Millisecond)
+		close(done)
+	}()
+
+	s.Stop()
+	s.Stop() // must not panic
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("MonitorWorkers did not return after Stop")
+	}
+
+	// Stop is also safe to call concurrently.
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.Stop()
+		}()
+	}
+	wg.Wait()
+
+	// A monitor started after Stop exits right away.
+	late := make(chan struct{})
+	go func() {
+		s.MonitorWorkers(10 * time.Millisecond)
+		close(late)
+	}()
+	select {
+	case <-late:
+	case <-time.After(time.Second):
+		t.Fatal("MonitorWorkers started after Stop did not return")
 	}
 }
 
