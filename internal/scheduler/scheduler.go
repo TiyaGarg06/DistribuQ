@@ -39,6 +39,16 @@ var (
 	ErrNoWorkersAvailable = errors.New("scheduler: no healthy workers available")
 	ErrTaskNotFound       = errors.New("scheduler: task not found")
 
+	// ErrEmptyTaskID is returned by SubmitTask when the task ID is "".
+	ErrEmptyTaskID = errors.New("scheduler: task id must not be empty")
+
+	// ErrDuplicateTask is returned by SubmitTask when a task with the
+	// same ID was already submitted. Task IDs are unique for the life
+	// of the scheduler, including after the task completes or fails;
+	// accepting a duplicate would silently overwrite a task that may
+	// still be running on a worker.
+	ErrDuplicateTask = errors.New("scheduler: a task with this id already exists")
+
 	// ErrStaleReport is returned when a worker reports the outcome of a
 	// task that is no longer assigned to it (for example, the worker was
 	// declared dead, the task was reassigned, and then the old worker
@@ -103,15 +113,25 @@ func (s *Scheduler) Heartbeat(workerID string) {
 }
 
 // SubmitTask queues a task and attempts immediate dispatch to the
-// least-loaded healthy worker.
-func (s *Scheduler) SubmitTask(id, payload string) *Task {
+// least-loaded healthy worker. It rejects an empty ID (ErrEmptyTaskID)
+// and an ID that has been used before (ErrDuplicateTask); in both
+// cases nothing is queued and existing tasks are left untouched.
+func (s *Scheduler) SubmitTask(id, payload string) (*Task, error) {
+	if id == "" {
+		return nil, ErrEmptyTaskID
+	}
+
 	s.mu.Lock()
+	if _, exists := s.tasks[id]; exists {
+		s.mu.Unlock()
+		return nil, ErrDuplicateTask
+	}
 	task := &Task{ID: id, Payload: payload, Status: TaskQueued, MaxRetries: 3}
 	s.tasks[id] = task
 	s.mu.Unlock()
 
 	_ = s.dispatch(task)
-	return task
+	return task, nil
 }
 
 // dispatch picks the least-loaded worker and hands the task to it. If
