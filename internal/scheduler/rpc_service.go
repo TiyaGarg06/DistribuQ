@@ -41,10 +41,13 @@ type HeartbeatArgs struct {
 	WorkerID string
 }
 
+// Heartbeat refreshes a worker's liveness. If the scheduler doesn't
+// know the worker (never registered, or already reaped), it returns
+// ErrUnknownWorker so the worker can register again.
 func (s *SchedulerService) Heartbeat(args *HeartbeatArgs, reply *OKReply) error {
-	s.S.Heartbeat(args.WorkerID)
-	reply.OK = true
-	return nil
+	err := s.S.Heartbeat(args.WorkerID)
+	reply.OK = err == nil
+	return err
 }
 
 type CompleteArgs struct {
@@ -84,12 +87,18 @@ type SubmitArgs struct {
 	Payload string
 }
 
+// SubmitTask queues a new task. Only the leader accepts submissions
+// (ErrNotLeader otherwise), and the scheduler rejects empty and
+// duplicate task IDs (ErrEmptyTaskID, ErrDuplicateTask).
 func (s *SchedulerService) SubmitTask(args *SubmitArgs, reply *OKReply) error {
 	if !s.requireLeader() {
 		reply.OK = false
 		return ErrNotLeader
 	}
-	s.S.SubmitTask(args.TaskID, args.Payload)
+	if _, err := s.S.SubmitTask(args.TaskID, args.Payload); err != nil {
+		reply.OK = false
+		return err
+	}
 	reply.OK = true
 	return nil
 }
