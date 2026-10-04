@@ -484,6 +484,37 @@ func TestReapFailsOrphanWhenRetriesExhausted(t *testing.T) {
 	}
 }
 
+// TestHeartbeatUnknownWorker checks that heartbeats from workers the
+// scheduler doesn't know about are rejected (instead of silently
+// ignored), and that registering again makes them valid.
+func TestHeartbeatUnknownWorker(t *testing.T) {
+	s := NewScheduler((&fakeDispatch{}).fn)
+
+	if err := s.Heartbeat("ghost"); !errors.Is(err, ErrUnknownWorker) {
+		t.Errorf("never-registered worker: expected ErrUnknownWorker, got %v", err)
+	}
+
+	s.RegisterWorker("w1", "localhost:9001")
+	if err := s.Heartbeat("w1"); err != nil {
+		t.Errorf("registered worker: expected nil, got %v", err)
+	}
+
+	// Reaped workers are forgotten, so their heartbeats are rejected...
+	s.mu.Lock()
+	s.workers["w1"].LastHeartbeat = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+	s.reapDeadWorkers()
+	if err := s.Heartbeat("w1"); !errors.Is(err, ErrUnknownWorker) {
+		t.Errorf("reaped worker: expected ErrUnknownWorker, got %v", err)
+	}
+
+	// ...until they register again.
+	s.RegisterWorker("w1", "localhost:9001")
+	if err := s.Heartbeat("w1"); err != nil {
+		t.Errorf("re-registered worker: expected nil, got %v", err)
+	}
+}
+
 func taskID(i int) string {
 	return "t" + string(rune('0'+i))
 }
