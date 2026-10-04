@@ -408,6 +408,82 @@ func TestStopIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestReapRejectsLateReportFromReapedWorker checks that once a dead
+// worker's tasks have been taken back, a completion report from that
+// worker (arriving while the reaper is still redispatching) is
+// rejected as stale rather than accepted and then clobbered.
+func TestReapRejectsLateReportFromReapedWorker(t *testing.T) {
+	var s *Scheduler
+	var staleResult error
+	var observed bool
+
+	dispatch := func(workerID, addr string, task *Task) error {
+		// Only intercept redispatches (to w2) made by the reaper, and
+		// only once: while the reaper is mid-redispatch, the reaped
+		// worker w1 reports completion of the *other* orphaned task.
+		if workerID == "w2" && !observed {
+			observed = true
+			other := "t1"
+			if task.ID == "t1" {
+				other = "t2"
+			}
+			staleResult = s.CompleteTaskBy(other, "w1")
+		}
+		return nil
+	}
+	s = NewScheduler(dispatch)
+
+	s.RegisterWorker("w1", "localhost:9001")
+	s.SubmitTask("t1", "payload")
+	s.SubmitTask("t2", "payload")
+	s.RegisterWorker("w2", "localhost:9002")
+
+	s.mu.Lock()
+	s.workers["w1"].LastHeartbeat = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+	s.reapDeadWorkers()
+
+	if !observed {
+		t.Fatal("test setup: reaper never redispatched to w2")
+	}
+	if !errors.Is(staleResult, ErrStaleReport) {
+		t.Errorf("late report from a reaped worker should be stale, got %v", staleResult)
+	}
+	for _, id := range []string{"t1", "t2"} {
+		status, attempts := taskState(s, id)
+		if status != TaskAssigned || attempts != 2 || taskWorker(s, id) != "w2" {
+			t.Errorf("%s: expected assigned to w2 on attempt 2, got %s on %q (attempt %d)",
+				id, status, taskWorker(s, id), attempts)
+		}
+	}
+}
+
+// TestReapFailsOrphanWhenRetriesExhausted checks that an orphaned task
+// with no attempts left goes straight to failed and is never
+// redispatched.
+func TestReapFailsOrphanWhenRetriesExhausted(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+
+	s.RegisterWorker("w1", "localhost:9001")
+	s.SubmitTask("t1", "payload")
+	s.mu.Lock()
+	s.tasks["t1"].Attempts = s.tasks["t1"].MaxRetries // pretend retries are used up
+	s.workers["w1"].LastHeartbeat = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+	s.RegisterWorker("w2", "localhost:9002")
+
+	dispatchesBefore := len(fd.log)
+	s.reapDeadWorkers()
+
+	if status, _ := taskState(s, "t1"); status != TaskFailed {
+		t.Errorf("expected exhausted orphan to be failed, got %s", status)
+	}
+	if len(fd.log) != dispatchesBefore {
+		t.Errorf("exhausted orphan must not be redispatched, got %d extra dispatch(es)", len(fd.log)-dispatchesBefore)
+	}
+}
+
 func taskID(i int) string {
 	return "t" + string(rune('0'+i))
 }
