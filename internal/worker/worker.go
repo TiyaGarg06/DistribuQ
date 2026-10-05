@@ -5,6 +5,7 @@
 package worker
 
 import (
+	"errors"
 	"log"
 	"net/rpc"
 	"time"
@@ -28,6 +29,11 @@ type Worker struct {
 	ID            string
 	SchedulerAddr string
 	Execute       TaskExecutor
+
+	// Addr is the address the scheduler should dial to reach this
+	// worker's RPC service. It is sent on every (re-)registration, so
+	// it must be set for a worker to be able to rejoin on its own.
+	Addr string
 }
 
 // WorkerService is the RPC-exported wrapper the scheduler calls into.
@@ -97,6 +103,26 @@ type FailArgs struct {
 	Cause    string
 }
 
+// RegisterArgs is what the scheduler's RegisterWorker RPC expects.
+type RegisterArgs struct {
+	WorkerID string
+	Addr     string
+}
+
+// Register announces this worker (and the address it can be reached
+// at) to the scheduler. It's safe to call repeatedly: registering an
+// already-known worker just refreshes it.
+func (w *Worker) Register() error {
+	client, err := rpc.Dial("tcp", w.SchedulerAddr)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	var reply struct{ OK bool }
+	return client.Call("SchedulerService.RegisterWorker", &RegisterArgs{WorkerID: w.ID, Addr: w.Addr}, &reply)
+}
+
 // StartHeartbeatLoop periodically pings the scheduler so it knows this
 // worker is alive; missing heartbeats trigger task reassignment on the
 // scheduler side (see scheduler.MonitorWorkers).
@@ -114,6 +140,13 @@ func (w *Worker) StartHeartbeatLoop(interval time.Duration, stopCh <-chan struct
 	}
 }
 
+// sendHeartbeat pings the scheduler once. If the scheduler answers
+// with an error, it is telling us it doesn't know this worker (the
+// only error Heartbeat can return): we were reaped after a missed
+// heartbeat, or the scheduler restarted or a new leader took over. In
+// that case the worker registers again instead of heartbeating
+// forever as a worker nobody will send work to. Network errors (the
+// scheduler is unreachable) are just logged; the next tick retries.
 func (w *Worker) sendHeartbeat() {
 	client, err := rpc.Dial("tcp", w.SchedulerAddr)
 	if err != nil {
@@ -123,7 +156,25 @@ func (w *Worker) sendHeartbeat() {
 	defer client.Close()
 
 	var reply struct{ OK bool }
-	_ = client.Call("SchedulerService.Heartbeat", &HeartbeatArgs{WorkerID: w.ID}, &reply)
+	err = client.Call("SchedulerService.Heartbeat", &HeartbeatArgs{WorkerID: w.ID}, &reply)
+	if err == nil {
+		return
+	}
+
+	var rejected rpc.ServerError
+	if !errors.As(err, &rejected) {
+		log.Printf("worker %s: heartbeat failed: %v", w.ID, err)
+		return
+	}
+
+	if w.Addr == "" {
+		log.Printf("worker %s: scheduler rejected heartbeat (%v) but Addr is unset, cannot re-register", w.ID, err)
+		return
+	}
+	log.Printf("worker %s: scheduler rejected heartbeat (%v), registering again", w.ID, err)
+	if rerr := w.Register(); rerr != nil {
+		log.Printf("worker %s: re-registration failed: %v", w.ID, rerr)
+	}
 }
 
 type HeartbeatArgs struct {
