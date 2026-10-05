@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -512,6 +514,215 @@ func TestHeartbeatUnknownWorker(t *testing.T) {
 	s.RegisterWorker("w1", "localhost:9001")
 	if err := s.Heartbeat("w1"); err != nil {
 		t.Errorf("re-registered worker: expected nil, got %v", err)
+	}
+}
+
+// stressJob is one dispatch that the simulated workers must act on.
+type stressJob struct {
+	taskID   string
+	workerID string
+	attempt  int
+}
+
+// TestConcurrentSubmitAndComplete hammers the scheduler from many
+// goroutines at once -- concurrent submits, workers completing and
+// failing tasks (which triggers retries and redispatch), plus
+// heartbeats and snapshots -- and then checks the invariants that
+// must hold no matter how the goroutines interleave. Its main job is
+// to give `go test -race` real contention to chew on.
+func TestConcurrentSubmitAndComplete(t *testing.T) {
+	const (
+		numWorkers    = 4
+		numTasks      = 200
+		numSubmitters = 8
+		numActors     = 8 // goroutines playing the part of workers
+		failEvery     = 5 // every 5th task fails its first attempt once
+	)
+
+	// Which tasks fail their first attempt. Built up front and only
+	// read afterwards, so it is safe to share between goroutines.
+	ids := make([]string, numTasks)
+	failsFirst := make(map[string]bool)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("task-%03d", i)
+		if i%failEvery == 0 {
+			failsFirst[ids[i]] = true
+		}
+	}
+
+	// The dispatch function hands each dispatch to the actors over a
+	// channel. It runs outside the scheduler's lock (dispatch releases
+	// it first), so the buffer only needs to cover the worst case of
+	// every task being dispatched twice, with room to spare.
+	jobs := make(chan stressJob, numTasks*3)
+	var dispatches int64
+	s := NewScheduler(func(workerID, addr string, task *Task) error {
+		atomic.AddInt64(&dispatches, 1)
+		jobs <- stressJob{taskID: task.ID, workerID: workerID, attempt: task.Attempts}
+		return nil
+	})
+
+	workerIDs := make([]string, numWorkers)
+	for i := range workerIDs {
+		workerIDs[i] = fmt.Sprintf("w%d", i+1)
+		s.RegisterWorker(workerIDs[i], fmt.Sprintf("localhost:%d", 9001+i))
+	}
+
+	// Simulated workers: complete each job, except that the first
+	// attempt of "failing" tasks is reported as a failure instead.
+	var actors sync.WaitGroup
+	for i := 0; i < numActors; i++ {
+		actors.Add(1)
+		go func() {
+			defer actors.Done()
+			for job := range jobs {
+				var err error
+				if job.attempt == 1 && failsFirst[job.taskID] {
+					err = s.FailTaskBy(job.taskID, job.workerID)
+				} else {
+					err = s.CompleteTaskBy(job.taskID, job.workerID)
+				}
+				if err != nil {
+					t.Errorf("report for %s from %s: %v", job.taskID, job.workerID, err)
+				}
+			}
+		}()
+	}
+
+	// Background noise: heartbeats and snapshots while all of that runs.
+	stop := make(chan struct{})
+	var background sync.WaitGroup
+	for _, id := range workerIDs {
+		background.Add(1)
+		go func(id string) {
+			defer background.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					if err := s.Heartbeat(id); err != nil {
+						t.Errorf("heartbeat for %s: %v", id, err)
+						return
+					}
+				}
+			}
+		}(id)
+	}
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				s.Snapshot()
+			}
+		}
+	}()
+
+	// Concurrent submitters, each taking every numSubmitters-th task.
+	var submitters sync.WaitGroup
+	for g := 0; g < numSubmitters; g++ {
+		submitters.Add(1)
+		go func(g int) {
+			defer submitters.Done()
+			for i := g; i < numTasks; i += numSubmitters {
+				if _, err := s.SubmitTask(ids[i], "payload"); err != nil {
+					t.Errorf("submit %s: %v", ids[i], err)
+				}
+			}
+		}(g)
+	}
+	submitters.Wait()
+
+	// Wait for every task to complete.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		tasks, _ := s.Snapshot()
+		allDone := len(tasks) == numTasks
+		counts := map[TaskStatus]int{}
+		for _, st := range tasks {
+			counts[st]++
+			if st != TaskCompleted {
+				allDone = false
+			}
+		}
+		if allDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(stop)
+			t.Fatalf("timed out waiting for completion: %d tasks known, statuses %v", len(tasks), counts)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Everything has completed, so no more dispatches can happen.
+	close(stop)
+	close(jobs)
+	actors.Wait()
+	background.Wait()
+
+	for i, id := range ids {
+		status, attempts := taskState(s, id)
+		wantAttempts := 1
+		if i%failEvery == 0 {
+			wantAttempts = 2
+		}
+		if status != TaskCompleted || attempts != wantAttempts {
+			t.Errorf("%s: expected completed after %d attempt(s), got %s after %d", id, wantAttempts, status, attempts)
+		}
+	}
+	for _, id := range workerIDs {
+		if n := activeTaskCount(s, id); n != 0 {
+			t.Errorf("%s still has %d active task(s) after everything completed", id, n)
+		}
+	}
+	wantDispatches := int64(numTasks + numTasks/failEvery)
+	if got := atomic.LoadInt64(&dispatches); got != wantDispatches {
+		t.Errorf("expected %d dispatches (every task once, failing tasks twice), got %d", wantDispatches, got)
+	}
+}
+
+// TestConcurrentDuplicateSubmitOnlyOneWins races many goroutines
+// submitting the same task ID and checks that exactly one of them wins
+// and the task is dispatched exactly once.
+func TestConcurrentDuplicateSubmitOnlyOneWins(t *testing.T) {
+	const goroutines = 20
+
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+	s.RegisterWorker("w1", "localhost:9001")
+
+	var accepted, rejected int32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release everyone at once to maximise the race
+			_, err := s.SubmitTask("same-id", "payload")
+			switch {
+			case err == nil:
+				atomic.AddInt32(&accepted, 1)
+			case errors.Is(err, ErrDuplicateTask):
+				atomic.AddInt32(&rejected, 1)
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if accepted != 1 || rejected != goroutines-1 {
+		t.Errorf("expected 1 accepted and %d rejected, got %d accepted and %d rejected", goroutines-1, accepted, rejected)
+	}
+	if got := len(fd.log); got != 1 {
+		t.Errorf("expected the task to be dispatched exactly once, got %d dispatches", got)
 	}
 }
 
