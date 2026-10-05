@@ -1,6 +1,9 @@
 package scheduler
 
-import "errors"
+import (
+	"errors"
+	"log"
+)
 
 // ErrNotLeader is returned by SchedulerService RPC methods that
 // require leadership (currently SubmitTask) when this replica is not
@@ -74,11 +77,34 @@ type FailArgs struct {
 	Cause    string
 }
 
+// maxLoggedCause caps how much of a worker-supplied failure cause is
+// written to the scheduler's log, so one task with huge error output
+// can't flood it.
+const maxLoggedCause = 500
+
+func truncateCause(cause string) string {
+	r := []rune(cause)
+	if len(r) <= maxLoggedCause {
+		return cause
+	}
+	return string(r[:maxLoggedCause]) + "... (truncated)"
+}
+
 // FailTask records a worker's report that a task's execution failed,
-// with the same stale-report protection as CompleteTask.
+// with the same stale-report protection as CompleteTask. The worker's
+// stated cause is logged so failures can be diagnosed from the
+// scheduler side; a report ignored as stale is logged as such.
 func (s *SchedulerService) FailTask(args *FailArgs, reply *OKReply) error {
 	err := s.S.FailTaskBy(args.TaskID, args.WorkerID)
 	reply.OK = err == nil
+
+	cause := truncateCause(args.Cause)
+	switch {
+	case err == nil:
+		log.Printf("scheduler: task %s failed on worker %s: %s", args.TaskID, args.WorkerID, cause)
+	case errors.Is(err, ErrStaleReport):
+		log.Printf("scheduler: ignoring stale failure report for task %s from worker %s: %s", args.TaskID, args.WorkerID, cause)
+	}
 	return err
 }
 
