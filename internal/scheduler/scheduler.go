@@ -5,6 +5,7 @@ package scheduler
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -26,6 +27,10 @@ type Task struct {
 	WorkerID   string
 	Attempts   int
 	MaxRetries int
+
+	// seq is the task's submission order, used to dispatch tasks that
+	// were left queued in first-come, first-served order.
+	seq uint64
 }
 
 type WorkerInfo struct {
@@ -76,6 +81,11 @@ type Scheduler struct {
 
 	tasks   map[string]*Task
 	workers map[string]*WorkerInfo
+	nextSeq uint64
+
+	// kick wakes MonitorWorkers to dispatch queued tasks right away
+	// (buffered so a registration never blocks on it).
+	kick chan struct{}
 
 	// dispatchFn sends a task to a worker; injected so it can be swapped
 	// (RPC today, gRPC later) without touching scheduling logic.
@@ -94,6 +104,7 @@ func NewScheduler(dispatchFn func(workerID, addr string, task *Task) error) *Sch
 		tasks:      make(map[string]*Task),
 		workers:    make(map[string]*WorkerInfo),
 		dispatchFn: dispatchFn,
+		kick:       make(chan struct{}, 1),
 		stopCh:     make(chan struct{}),
 	}
 }
@@ -113,6 +124,14 @@ func (s *Scheduler) RegisterWorker(id, addr string) {
 		Addr:          addr,
 		LastHeartbeat: time.Now(),
 		ActiveTasks:   make(map[string]bool),
+	}
+
+	// A new worker may be exactly what queued tasks were waiting for.
+	// Nudge the monitor without blocking the caller (usually an RPC
+	// handler); if a nudge is already pending, that one will do.
+	select {
+	case s.kick <- struct{}{}:
+	default:
 	}
 }
 
@@ -145,7 +164,8 @@ func (s *Scheduler) SubmitTask(id, payload string) (*Task, error) {
 		s.mu.Unlock()
 		return nil, ErrDuplicateTask
 	}
-	task := &Task{ID: id, Payload: payload, Status: TaskQueued, MaxRetries: 3}
+	s.nextSeq++
+	task := &Task{ID: id, Payload: payload, Status: TaskQueued, MaxRetries: 3, seq: s.nextSeq}
 	s.tasks[id] = task
 	s.mu.Unlock()
 
@@ -161,8 +181,18 @@ func (s *Scheduler) SubmitTask(id, payload string) (*Task, error) {
 // back up. Retries are naturally bounded: each attempt increments
 // task.Attempts, and once Attempts reaches MaxRetries the task is
 // marked TaskFailed instead of requeued, which stops the recursion.
+//
+// dispatch only acts on tasks that are still queued. Several code
+// paths can try to dispatch the same task around the same time (the
+// failure path, the reaper, and the monitor's sweep of queued tasks);
+// whichever gets here first takes it, and the rest see it is already
+// assigned and return nil instead of dispatching it a second time.
 func (s *Scheduler) dispatch(task *Task) error {
 	s.mu.Lock()
+	if task.Status != TaskQueued {
+		s.mu.Unlock()
+		return nil
+	}
 	worker := s.pickLeastLoadedWorkerLocked()
 	if worker == nil {
 		s.mu.Unlock()
@@ -307,7 +337,10 @@ func (s *Scheduler) failTask(taskID, workerID string, checkWorker bool) error {
 // MonitorWorkers should run in a goroutine. It periodically checks for
 // workers that have gone silent past WorkerTimeout, marks them dead,
 // and reassigns their in-flight tasks to healthy workers -- this is
-// the core fault-recovery behavior of the system.
+// the core fault-recovery behavior of the system. It also dispatches
+// any tasks still sitting in the queue (submitted while no worker was
+// available, say), both on every tick and immediately when a new
+// worker registers.
 func (s *Scheduler) MonitorWorkers(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -318,7 +351,35 @@ func (s *Scheduler) MonitorWorkers(interval time.Duration) {
 			return
 		case <-ticker.C:
 			s.reapDeadWorkers()
+			s.dispatchQueued()
+		case <-s.kick:
+			s.dispatchQueued()
 		}
+	}
+}
+
+// dispatchQueued hands every queued task to a worker, oldest
+// submission first. Without it, a task that couldn't be dispatched at
+// submit time (no healthy worker yet) would stay queued forever,
+// because nothing else ever retries it. Tasks that still can't be
+// placed are left queued for the next sweep.
+func (s *Scheduler) dispatchQueued() {
+	s.mu.Lock()
+	if s.pickLeastLoadedWorkerLocked() == nil {
+		s.mu.Unlock()
+		return
+	}
+	var queued []*Task
+	for _, t := range s.tasks {
+		if t.Status == TaskQueued {
+			queued = append(queued, t)
+		}
+	}
+	s.mu.Unlock()
+
+	sort.Slice(queued, func(i, j int) bool { return queued[i].seq < queued[j].seq })
+	for _, t := range queued {
+		s.dispatch(t)
 	}
 }
 
