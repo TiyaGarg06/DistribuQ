@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log"
 	"net/rpc"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,31 @@ type Worker struct {
 	// worker's RPC service. It is sent on every (re-)registration, so
 	// it must be set for a worker to be able to rejoin on its own.
 	Addr string
+
+	// MaxConcurrent caps how many tasks this worker executes at the
+	// same time; 0 (the default) means no cap. Tasks beyond the cap are
+	// still accepted and simply wait for a free slot. They are not
+	// rejected: a rejected dispatch counts as a failed attempt on the
+	// scheduler side, so refusing work under load would burn retries
+	// and could permanently fail tasks that did nothing wrong.
+	MaxConcurrent int
+
+	slotsOnce sync.Once
+	slots     chan struct{}
+}
+
+// runWithSlot executes a task, first waiting for a free concurrency
+// slot if MaxConcurrent is set. The slot is released as soon as
+// execution ends, whether it succeeded or failed, and before the
+// result is reported over the network, so reporting never holds up
+// other tasks.
+func (w *Worker) runWithSlot(taskID, payload string) error {
+	if w.MaxConcurrent > 0 {
+		w.slotsOnce.Do(func() { w.slots = make(chan struct{}, w.MaxConcurrent) })
+		w.slots <- struct{}{}
+		defer func() { <-w.slots }()
+	}
+	return w.Execute(taskID, payload)
 }
 
 // WorkerService is the RPC-exported wrapper the scheduler calls into.
@@ -50,7 +76,7 @@ func NewWorkerService(w *Worker) *WorkerService {
 func (ws *WorkerService) ExecuteTask(args *ExecuteArgs, reply *ExecuteReply) error {
 	reply.Accepted = true
 	go func() {
-		if err := ws.w.Execute(args.TaskID, args.Payload); err != nil {
+		if err := ws.w.runWithSlot(args.TaskID, args.Payload); err != nil {
 			log.Printf("worker %s: task %s failed: %v", ws.w.ID, args.TaskID, err)
 			if rerr := ws.w.reportFailure(args.TaskID, err); rerr != nil {
 				log.Printf("worker %s: failed to report failure for %s: %v", ws.w.ID, args.TaskID, rerr)
