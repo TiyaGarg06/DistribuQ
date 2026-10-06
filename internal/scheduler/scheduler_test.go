@@ -726,6 +726,143 @@ func TestConcurrentDuplicateSubmitOnlyOneWins(t *testing.T) {
 	}
 }
 
+// waitFor polls cond until it is true, failing the test if it doesn't
+// become true within a couple of seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestQueuedTaskDispatchedWhenWorkerRegisters is the original bug: a
+// task submitted while no worker exists used to stay queued forever,
+// even after a healthy worker joined. The monitor's tick is set far in
+// the future so only the registration nudge can be what dispatches it.
+func TestQueuedTaskDispatchedWhenWorkerRegisters(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+	go s.MonitorWorkers(10 * time.Hour)
+	defer s.Stop()
+
+	if _, err := s.SubmitTask("t1", "payload"); err != nil {
+		t.Fatalf("SubmitTask: %v", err)
+	}
+	if status, _ := taskState(s, "t1"); status != TaskQueued {
+		t.Fatalf("setup: expected t1 queued with no workers, got %s", status)
+	}
+
+	s.RegisterWorker("w1", "localhost:9001")
+
+	waitFor(t, "t1 to be dispatched after w1 registered", func() bool {
+		status, _ := taskState(s, "t1")
+		return status == TaskAssigned
+	})
+	if got := fd.count("w1"); got != 1 {
+		t.Errorf("expected exactly 1 dispatch to w1, got %d", got)
+	}
+	if status, attempts := taskState(s, "t1"); status != TaskAssigned || attempts != 1 {
+		t.Errorf("expected t1 assigned on attempt 1, got %s on attempt %d", status, attempts)
+	}
+}
+
+// TestMonitorTickDispatchesQueuedTasks checks the periodic sweep on
+// its own, without the registration nudge: a worker that is already
+// known (so no nudge is pending) still picks up queued work.
+func TestMonitorTickDispatchesQueuedTasks(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+
+	s.SubmitTask("t1", "payload") // queued: no workers yet
+	s.RegisterWorker("w1", "localhost:9001")
+	select { // discard the registration nudge so only the tick can act
+	case <-s.kick:
+	default:
+	}
+
+	go s.MonitorWorkers(10 * time.Millisecond)
+	defer s.Stop()
+
+	waitFor(t, "the monitor tick to dispatch t1", func() bool {
+		status, _ := taskState(s, "t1")
+		return status == TaskAssigned
+	})
+}
+
+// TestQueuedTasksDispatchedInSubmissionOrder checks that the backlog
+// is worked off first-come, first-served rather than in map order.
+func TestQueuedTasksDispatchedInSubmissionOrder(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+
+	const n = 10
+	for i := 0; i < n; i++ {
+		s.SubmitTask(taskID(i), "payload")
+	}
+	s.RegisterWorker("w1", "localhost:9001")
+
+	s.dispatchQueued()
+
+	if len(fd.log) != n {
+		t.Fatalf("expected %d dispatches, got %d", n, len(fd.log))
+	}
+	for i := 0; i < n; i++ {
+		if want := "w1:" + taskID(i); fd.log[i] != want {
+			t.Errorf("dispatch %d: expected %s, got %s (full order %v)", i, want, fd.log[i], fd.log)
+			break
+		}
+	}
+}
+
+// TestDispatchQueuedWithoutWorkersLeavesTasksQueued checks that a sweep
+// with nobody to give work to changes nothing and doesn't burn attempts.
+func TestDispatchQueuedWithoutWorkersLeavesTasksQueued(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+	s.SubmitTask("t1", "payload")
+
+	s.dispatchQueued()
+
+	status, attempts := taskState(s, "t1")
+	if status != TaskQueued || attempts != 0 {
+		t.Errorf("expected t1 still queued with 0 attempts, got %s with %d", status, attempts)
+	}
+	if len(fd.log) != 0 {
+		t.Errorf("expected no dispatches, got %d", len(fd.log))
+	}
+}
+
+// TestDispatchIgnoresTaskNoLongerQueued checks the guard that stops two
+// code paths racing to dispatch the same task: once a task has been
+// taken, a second dispatch is a no-op.
+func TestDispatchIgnoresTaskNoLongerQueued(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+	s.RegisterWorker("w1", "localhost:9001")
+
+	task, err := s.SubmitTask("t1", "payload")
+	if err != nil {
+		t.Fatalf("SubmitTask: %v", err)
+	}
+	if status, attempts := taskState(s, "t1"); status != TaskAssigned || attempts != 1 {
+		t.Fatalf("setup: expected t1 assigned on attempt 1, got %s on %d", status, attempts)
+	}
+
+	if err := s.dispatch(task); err != nil {
+		t.Errorf("dispatching an already-assigned task should be a quiet no-op, got %v", err)
+	}
+	if status, attempts := taskState(s, "t1"); status != TaskAssigned || attempts != 1 {
+		t.Errorf("second dispatch changed the task: %s on attempt %d", status, attempts)
+	}
+	if len(fd.log) != 1 {
+		t.Errorf("expected exactly 1 dispatch overall, got %d", len(fd.log))
+	}
+}
+
 func taskID(i int) string {
 	return "t" + string(rune('0'+i))
 }
