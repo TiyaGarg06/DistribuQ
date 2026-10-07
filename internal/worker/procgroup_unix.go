@@ -23,4 +23,4 @@ func configureProcessGroup(cmd *exec.Cmd) {
 		}
 		return err
 	}
-}a
+}
