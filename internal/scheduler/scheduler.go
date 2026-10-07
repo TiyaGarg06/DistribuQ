@@ -31,6 +31,11 @@ type Task struct {
 	// seq is the task's submission order, used to dispatch tasks that
 	// were left queued in first-come, first-served order.
 	seq uint64
+
+	// tried records the workers this task has already come off of
+	// without completing (dispatch error, reported failure, or the
+	// worker going silent). Dispatch prefers workers not in this set.
+	tried map[string]bool
 }
 
 type WorkerInfo struct {
@@ -193,7 +198,7 @@ func (s *Scheduler) dispatch(task *Task) error {
 		s.mu.Unlock()
 		return nil
 	}
-	worker := s.pickLeastLoadedWorkerLocked()
+	worker := s.pickWorkerLocked(task.tried)
 	if worker == nil {
 		s.mu.Unlock()
 		return ErrNoWorkersAvailable
@@ -228,7 +233,20 @@ func (s *Scheduler) dispatch(task *Task) error {
 // worker death): retry it if attempts remain, otherwise mark it
 // permanently failed. Callers must hold s.mu and must have already
 // cleared the task out of its former worker's ActiveTasks.
+//
+// The worker the task is coming off of is remembered in task.tried
+// first, so the retry goes somewhere else when it can. Without that, a
+// worker that keeps failing dispatches looks like the least loaded one
+// (its failed tasks never stay on it), so least-loaded selection keeps
+// sending it the very tasks it just failed, and they run out of
+// attempts while healthy workers sit idle.
 func (s *Scheduler) requeueOrFailLocked(task *Task) {
+	if task.WorkerID != "" {
+		if task.tried == nil {
+			task.tried = make(map[string]bool)
+		}
+		task.tried[task.WorkerID] = true
+	}
 	if task.Attempts < task.MaxRetries {
 		task.Status = TaskQueued
 		task.WorkerID = ""
@@ -238,18 +256,38 @@ func (s *Scheduler) requeueOrFailLocked(task *Task) {
 	}
 }
 
+// pickLeastLoadedWorkerLocked returns the least-loaded healthy worker,
+// or nil if there is none.
 func (s *Scheduler) pickLeastLoadedWorkerLocked() *WorkerInfo {
-	var best *WorkerInfo
+	return s.pickWorkerLocked(nil)
+}
+
+// pickWorkerLocked returns the least-loaded healthy worker, preferring
+// workers not in avoid. If every healthy worker is in avoid (a one- or
+// two-worker cluster, say), it falls back to the least-loaded of those
+// rather than leave the task with nowhere to run. Returns nil only if
+// there are no healthy workers at all.
+func (s *Scheduler) pickWorkerLocked(avoid map[string]bool) *WorkerInfo {
+	var best, bestAvoided *WorkerInfo
 	now := time.Now()
 	for _, w := range s.workers {
 		if now.Sub(w.LastHeartbeat) > WorkerTimeout {
 			continue // treat as dead, skip
 		}
+		if avoid[w.ID] {
+			if bestAvoided == nil || len(w.ActiveTasks) < len(bestAvoided.ActiveTasks) {
+				bestAvoided = w
+			}
+			continue
+		}
 		if best == nil || len(w.ActiveTasks) < len(best.ActiveTasks) {
 			best = w
 		}
 	}
-	return best
+	if best != nil {
+		return best
+	}
+	return bestAvoided
 }
 
 // CompleteTask marks a task finished and frees the worker's slot. It
