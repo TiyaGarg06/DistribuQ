@@ -863,6 +863,122 @@ func TestDispatchIgnoresTaskNoLongerQueued(t *testing.T) {
 	}
 }
 
+// TestFailedDispatchAvoidsBrokenWorker is the "black hole" bug: w1
+// refuses every task (its process is down but it still looks alive).
+// A failed dispatch leaves w1 with no load, so plain least-loaded
+// selection kept handing it the same task until the task ran out of
+// attempts, while healthy w2 sat there. Retries must move to w2.
+func TestFailedDispatchAvoidsBrokenWorker(t *testing.T) {
+	dispatch := func(workerID, addr string, task *Task) error {
+		if workerID == "w1" {
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+	s := NewScheduler(dispatch)
+	s.RegisterWorker("w1", "localhost:9001")
+	s.RegisterWorker("w2", "localhost:9002")
+
+	const n = 100
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("task-%03d", i)
+		if _, err := s.SubmitTask(id, "payload"); err != nil {
+			t.Fatalf("SubmitTask: %v", err)
+		}
+		status, attempts := taskState(s, id)
+		if status != TaskAssigned || taskWorker(s, id) != "w2" {
+			t.Fatalf("%s: expected assigned to healthy w2, got %s on %q after %d attempt(s)",
+				id, status, taskWorker(s, id), attempts)
+		}
+		if attempts > 2 {
+			t.Errorf("%s: needed %d attempts; a task should reach w2 on its second try at the latest", id, attempts)
+		}
+	}
+}
+
+// TestExecutionFailureMovesTaskToDifferentWorker checks that a task a
+// worker reported as failed is retried on another worker even when the
+// worker that just failed it is the less loaded one.
+func TestExecutionFailureMovesTaskToDifferentWorker(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+
+	s.RegisterWorker("w1", "localhost:9001")
+	s.SubmitTask("t1", "payload") // only w1 exists, so it goes there
+	s.RegisterWorker("w2", "localhost:9002")
+
+	// Make w2 strictly busier than w1 will be once t1 comes off it, so
+	// plain least-loaded selection would pick w1 again.
+	s.mu.Lock()
+	s.workers["w2"].ActiveTasks["other-work"] = true
+	s.mu.Unlock()
+
+	if err := s.FailTaskBy("t1", "w1"); err != nil {
+		t.Fatalf("FailTaskBy: %v", err)
+	}
+
+	status, attempts := taskState(s, "t1")
+	if status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w2" {
+		t.Errorf("expected t1 retried on w2 (attempt 2), got %s on %q (attempt %d)",
+			status, taskWorker(s, "t1"), attempts)
+	}
+}
+
+// TestTriedWorkerIsLastResort checks that avoiding a worker is only a
+// preference: with nowhere else to go, the retry still uses it.
+func TestTriedWorkerIsLastResort(t *testing.T) {
+	calls := 0
+	dispatch := func(workerID, addr string, task *Task) error {
+		calls++
+		if calls == 1 {
+			return errors.New("transient hiccup")
+		}
+		return nil
+	}
+	s := NewScheduler(dispatch)
+	s.RegisterWorker("w1", "localhost:9001")
+
+	s.SubmitTask("t1", "payload")
+
+	status, attempts := taskState(s, "t1")
+	if status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w1" {
+		t.Errorf("expected retry on the only worker, w1 (attempt 2), got %s on %q (attempt %d)",
+			status, taskWorker(s, "t1"), attempts)
+	}
+}
+
+// TestRetryPrefersLeastLoadedAmongUntriedWorkers checks that skipping
+// the failed worker doesn't turn retries into a random pick: among the
+// remaining workers, the least loaded one still wins.
+func TestRetryPrefersLeastLoadedAmongUntriedWorkers(t *testing.T) {
+	dispatch := func(workerID, addr string, task *Task) error {
+		if workerID == "w1" {
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+	s := NewScheduler(dispatch)
+	s.RegisterWorker("w1", "localhost:9001")
+	s.RegisterWorker("w2", "localhost:9002")
+	s.RegisterWorker("w3", "localhost:9003")
+
+	// w1 is idle, so the first attempt goes to it (and fails). Of the
+	// others, w3 is lighter than w2.
+	s.mu.Lock()
+	s.workers["w2"].ActiveTasks["a"] = true
+	s.workers["w2"].ActiveTasks["b"] = true
+	s.workers["w3"].ActiveTasks["c"] = true
+	s.mu.Unlock()
+
+	s.SubmitTask("t1", "payload")
+
+	status, attempts := taskState(s, "t1")
+	if status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w3" {
+		t.Errorf("expected retry on least-loaded untried worker w3 (attempt 2), got %s on %q (attempt %d)",
+			status, taskWorker(s, "t1"), attempts)
+	}
+}
+
 func taskID(i int) string {
 	return "t" + string(rune('0'+i))
 }
