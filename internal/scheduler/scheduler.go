@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -102,6 +103,13 @@ type Scheduler struct {
 	// easily end up calling Stop more than once.
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// sweeping is true while a background dispatch sweep is running;
+	// sweepAgain records that more work may have arrived since it
+	// last looked. Together they keep at most one sweep in flight
+	// without ever losing a request for another pass (see sweepAsync).
+	sweeping   atomic.Bool
+	sweepAgain atomic.Bool
 }
 
 func NewScheduler(dispatchFn func(workerID, addr string, task *Task) error) *Scheduler {
@@ -182,16 +190,17 @@ func (s *Scheduler) SubmitTask(id, payload string) (*Task, error) {
 // dispatchFn fails, the tentative assignment is rolled back and the
 // task is requeued (or marked failed past MaxRetries); if requeued,
 // dispatch immediately retries against a different worker rather than
-// leaving the task sitting as TaskQueued with nothing to ever pick it
-// back up. Retries are naturally bounded: each attempt increments
-// task.Attempts, and once Attempts reaches MaxRetries the task is
-// marked TaskFailed instead of requeued, which stops the recursion.
+// waiting for the next sweep. Retries are naturally bounded: each
+// attempt increments task.Attempts, and once Attempts reaches
+// MaxRetries the task is marked TaskFailed instead of requeued, which
+// stops the recursion.
 //
 // dispatch only acts on tasks that are still queued. Several code
 // paths can try to dispatch the same task around the same time (the
-// failure path, the reaper, and the monitor's sweep of queued tasks);
-// whichever gets here first takes it, and the rest see it is already
-// assigned and return nil instead of dispatching it a second time.
+// failure path, the submit path, and the monitor's sweep of queued
+// tasks); whichever gets here first takes it, and the rest see it is
+// already assigned and return nil instead of dispatching it a second
+// time.
 func (s *Scheduler) dispatch(task *Task) error {
 	s.mu.Lock()
 	if task.Status != TaskQueued {
@@ -213,6 +222,15 @@ func (s *Scheduler) dispatch(task *Task) error {
 
 	if err := s.dispatchFn(workerID, addr, task); err != nil {
 		s.mu.Lock()
+		// The call may have been stuck for a long time. If, meanwhile,
+		// the worker was reaped and the task reassigned, it no longer
+		// belongs to this attempt and there is nothing to roll back:
+		// touching it now would requeue or double-dispatch a task that
+		// is already running somewhere else.
+		if task.Status != TaskAssigned || task.WorkerID != workerID {
+			s.mu.Unlock()
+			return err
+		}
 		if w, ok := s.workers[workerID]; ok {
 			delete(w.ActiveTasks, task.ID)
 		}
@@ -329,11 +347,9 @@ func (s *Scheduler) completeTask(taskID, workerID string, checkWorker bool) erro
 // failed (as opposed to a dispatch-time failure, handled in dispatch,
 // or a worker going silent, handled in reapDeadWorkers). It frees the
 // worker's slot and, if attempts remain, requeues the task and
-// immediately attempts redispatch to a different worker (mirroring
-// reapDeadWorkers); once MaxRetries is exhausted it's marked
-// permanently failed instead. Without the redispatch step, a requeued
-// task would sit as TaskQueued forever, since nothing else
-// periodically retries queued tasks.
+// immediately attempts redispatch to a different worker rather than
+// leaving the task queued until the next sweep; once MaxRetries is
+// exhausted it's marked permanently failed instead.
 //
 // It accepts the report regardless of which worker sent it; prefer
 // FailTaskBy, which rejects stale reports.
@@ -374,11 +390,17 @@ func (s *Scheduler) failTask(taskID, workerID string, checkWorker bool) error {
 
 // MonitorWorkers should run in a goroutine. It periodically checks for
 // workers that have gone silent past WorkerTimeout, marks them dead,
-// and reassigns their in-flight tasks to healthy workers -- this is
-// the core fault-recovery behavior of the system. It also dispatches
-// any tasks still sitting in the queue (submitted while no worker was
-// available, say), both on every tick and immediately when a new
-// worker registers.
+// and puts their in-flight tasks back in the queue -- this is the core
+// fault-recovery behavior of the system. It also dispatches any tasks
+// sitting in the queue (orphans from a dead worker, or tasks submitted
+// while no worker was available), both on every tick and immediately
+// when a new worker registers.
+//
+// The monitor itself never makes a network call: dispatching happens
+// in a background sweep (see sweepAsync). A dispatch can block for a
+// long time on an unresponsive worker, and if it ran inline here, one
+// frozen worker would stop the monitor and with it all failure
+// detection for every other worker.
 func (s *Scheduler) MonitorWorkers(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -389,18 +411,44 @@ func (s *Scheduler) MonitorWorkers(interval time.Duration) {
 			return
 		case <-ticker.C:
 			s.reapDeadWorkers()
-			s.dispatchQueued()
+			s.sweepAsync()
 		case <-s.kick:
-			s.dispatchQueued()
+			s.sweepAsync()
 		}
 	}
 }
 
+// sweepAsync dispatches queued tasks in a background goroutine, with at
+// most one sweep running at a time. A request that arrives while a
+// sweep is running is not dropped: it sets sweepAgain, and the running
+// sweep makes another pass before it finishes. If one dispatch inside
+// a sweep is stuck, the sweep waits on it, so queued tasks are delayed
+// -- but failure detection, which runs in the monitor, is not.
+func (s *Scheduler) sweepAsync() {
+	s.sweepAgain.Store(true)
+	if !s.sweeping.CompareAndSwap(false, true) {
+		return // the running sweep will see sweepAgain and go again
+	}
+	go func() {
+		for s.sweepAgain.CompareAndSwap(true, false) {
+			s.dispatchQueued()
+		}
+		s.sweeping.Store(false)
+		// A request may have landed between the last check above and
+		// clearing sweeping; if so, start another sweep to handle it.
+		if s.sweepAgain.Load() {
+			s.sweepAsync()
+		}
+	}()
+}
+
 // dispatchQueued hands every queued task to a worker, oldest
-// submission first. Without it, a task that couldn't be dispatched at
-// submit time (no healthy worker yet) would stay queued forever,
-// because nothing else ever retries it. Tasks that still can't be
-// placed are left queued for the next sweep.
+// submission first, one after another. It blocks for as long as the
+// dispatches do, so the monitor runs it through sweepAsync rather than
+// calling it directly. It is what gets queued tasks moving again: ones
+// orphaned by a dead worker, or submitted while no healthy worker
+// existed. Tasks that still can't be placed are left queued for the
+// next sweep.
 func (s *Scheduler) dispatchQueued() {
 	s.mu.Lock()
 	if s.pickLeastLoadedWorkerLocked() == nil {
@@ -430,23 +478,25 @@ func (s *Scheduler) Stop() {
 }
 
 // reapDeadWorkers removes workers that have gone silent past
-// WorkerTimeout and puts their in-flight tasks back in play.
+// WorkerTimeout and takes back their in-flight tasks: each is requeued,
+// or failed for good if it is out of attempts.
 //
-// Each orphaned task's fate (requeue or permanent failure) is decided
-// inside the same critical section that removes its worker, and its
-// WorkerID is cleared there. That closes a race where the "dead"
-// worker could report completion between the worker's removal and the
-// task being requeued: the task no longer belongs to that worker, so
-// its late report is rejected as stale (see CompleteTaskBy) instead of
-// being overwritten, which would have resurrected a finished task and
-// run it a second time. Redispatch happens after the lock is released
-// because dispatch takes the lock itself and calls out over the
-// network.
+// It only changes scheduler state and never calls dispatchFn, so it
+// cannot block on the network; the requeued tasks are picked up by the
+// dispatch sweep that follows (see MonitorWorkers and dispatchQueued).
+//
+// Each orphaned task's fate is decided inside the same critical
+// section that removes its worker, and its WorkerID is cleared there.
+// That closes a race where the "dead" worker could report completion
+// between the worker's removal and the task being requeued: the task
+// no longer belongs to that worker, so its late report is rejected as
+// stale (see CompleteTaskBy) instead of being overwritten, which would
+// have resurrected a finished task and run it a second time.
 func (s *Scheduler) reapDeadWorkers() {
 	now := time.Now()
 
-	var requeued []*Task
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for id, w := range s.workers {
 		if now.Sub(w.LastHeartbeat) <= WorkerTimeout {
 			continue
@@ -460,16 +510,8 @@ func (s *Scheduler) reapDeadWorkers() {
 				continue // already finished; nothing to recover
 			}
 			s.requeueOrFailLocked(t)
-			if t.Status == TaskQueued {
-				requeued = append(requeued, t)
-			}
 		}
 		delete(s.workers, id)
-	}
-	s.mu.Unlock()
-
-	for _, t := range requeued {
-		s.dispatch(t)
 	}
 }
 
