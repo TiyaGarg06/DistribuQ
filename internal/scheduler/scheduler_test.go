@@ -94,6 +94,7 @@ func TestDeadWorkerTasksAreReassigned(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	s.Heartbeat("w2") // w2 stays alive; only w1 has gone silent
 	s.reapDeadWorkers()
+	s.dispatchQueued() // the reaper only requeues; the sweep redispatches
 
 	tasks, workerCount := s.Snapshot()
 	if workerCount != 1 {
@@ -220,6 +221,7 @@ func newReassignedTask(t *testing.T) (*Scheduler, *fakeDispatch) {
 	s.workers["w1"].LastHeartbeat = time.Now().Add(-time.Hour)
 	s.mu.Unlock()
 	s.reapDeadWorkers()
+	s.dispatchQueued()
 
 	status, attempts := taskState(s, "t1")
 	if status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w2" {
@@ -412,17 +414,18 @@ func TestStopIsIdempotent(t *testing.T) {
 
 // TestReapRejectsLateReportFromReapedWorker checks that once a dead
 // worker's tasks have been taken back, a completion report from that
-// worker (arriving while the reaper is still redispatching) is
-// rejected as stale rather than accepted and then clobbered.
+// worker (arriving while they are being redispatched) is rejected as
+// stale rather than accepted and then clobbered.
 func TestReapRejectsLateReportFromReapedWorker(t *testing.T) {
 	var s *Scheduler
 	var staleResult error
 	var observed bool
 
 	dispatch := func(workerID, addr string, task *Task) error {
-		// Only intercept redispatches (to w2) made by the reaper, and
-		// only once: while the reaper is mid-redispatch, the reaped
-		// worker w1 reports completion of the *other* orphaned task.
+		// Only intercept redispatches (to w2) of the reaped worker's
+		// tasks, and only once: while that redispatch is in progress,
+		// the reaped worker w1 reports completion of the *other*
+		// orphaned task.
 		if workerID == "w2" && !observed {
 			observed = true
 			other := "t1"
@@ -444,9 +447,10 @@ func TestReapRejectsLateReportFromReapedWorker(t *testing.T) {
 	s.workers["w1"].LastHeartbeat = time.Now().Add(-time.Hour)
 	s.mu.Unlock()
 	s.reapDeadWorkers()
+	s.dispatchQueued() // the hook above fires during this redispatch
 
 	if !observed {
-		t.Fatal("test setup: reaper never redispatched to w2")
+		t.Fatal("test setup: nothing was redispatched to w2")
 	}
 	if !errors.Is(staleResult, ErrStaleReport) {
 		t.Errorf("late report from a reaped worker should be stale, got %v", staleResult)
@@ -477,6 +481,7 @@ func TestReapFailsOrphanWhenRetriesExhausted(t *testing.T) {
 
 	dispatchesBefore := len(fd.log)
 	s.reapDeadWorkers()
+	s.dispatchQueued()
 
 	if status, _ := taskState(s, "t1"); status != TaskFailed {
 		t.Errorf("expected exhausted orphan to be failed, got %s", status)
@@ -977,6 +982,222 @@ func TestRetryPrefersLeastLoadedAmongUntriedWorkers(t *testing.T) {
 		t.Errorf("expected retry on least-loaded untried worker w3 (attempt 2), got %s on %q (attempt %d)",
 			status, taskWorker(s, "t1"), attempts)
 	}
+}
+
+// markWorkerDead makes a worker look like it stopped heartbeating long
+// ago, without sleeping.
+func markWorkerDead(s *Scheduler, id string) {
+	s.mu.Lock()
+	s.workers[id].LastHeartbeat = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+}
+
+// workerKnown reports whether the scheduler still has a record of id.
+func workerKnown(s *Scheduler, id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.workers[id]
+	return ok
+}
+
+// TestReapOnlyRequeuesAndNeverDispatches pins down the property the
+// monitor depends on: reaping changes scheduler state and makes no
+// dispatch call, so it can never block on the network. The orphan is
+// simply left queued for the dispatch sweep.
+func TestReapOnlyRequeuesAndNeverDispatches(t *testing.T) {
+	fd := &fakeDispatch{}
+	s := NewScheduler(fd.fn)
+	s.RegisterWorker("w1", "localhost:9001")
+	s.SubmitTask("t1", "payload") // goes to w1
+	s.RegisterWorker("w2", "localhost:9002")
+	markWorkerDead(s, "w1")
+
+	dispatchesBefore := len(fd.log)
+	s.reapDeadWorkers()
+
+	if len(fd.log) != dispatchesBefore {
+		t.Errorf("reaping must not dispatch, but made %d dispatch call(s)", len(fd.log)-dispatchesBefore)
+	}
+	status, attempts := taskState(s, "t1")
+	if status != TaskQueued || attempts != 1 || taskWorker(s, "t1") != "" {
+		t.Errorf("expected t1 requeued and unassigned after the reap, got %s on %q (attempt %d)",
+			status, taskWorker(s, "t1"), attempts)
+	}
+
+	s.dispatchQueued()
+	status, attempts = taskState(s, "t1")
+	if status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w2" {
+		t.Errorf("expected the sweep to hand t1 to w2 (attempt 2), got %s on %q (attempt %d)",
+			status, taskWorker(s, "t1"), attempts)
+	}
+}
+
+// TestHungDispatchDoesNotStopFailureDetection is the cascade from the
+// audit: w1 is frozen (its dispatch call never returns). A dead
+// worker's task gets redispatched to it, and that used to run inside
+// the monitor loop, freezing the monitor, so the next worker to die was
+// never noticed. Failure detection must keep working.
+func TestHungDispatchDoesNotStopFailureDetection(t *testing.T) {
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) }) // let the stuck dispatch goroutine finish
+	dispatch := func(workerID, addr string, task *Task) error {
+		if workerID == "w1" {
+			<-block // frozen worker: the call never returns
+		}
+		return nil
+	}
+	s := NewScheduler(dispatch)
+	s.RegisterWorker("w1", "localhost:9001")
+
+	// w1 is frozen but its heartbeats still arrive, so it stays "healthy"
+	// and is the only candidate for redispatched work.
+	stopHB := make(chan struct{})
+	defer close(stopHB)
+	go func() {
+		for {
+			select {
+			case <-stopHB:
+				return
+			case <-time.After(10 * time.Millisecond):
+				s.Heartbeat("w1")
+			}
+		}
+	}()
+
+	addDeadWorkerWithTask := func(workerID, taskID string) {
+		s.mu.Lock()
+		s.workers[workerID] = &WorkerInfo{
+			ID: workerID, Addr: "x",
+			LastHeartbeat: time.Now().Add(-time.Hour),
+			ActiveTasks:   map[string]bool{taskID: true},
+		}
+		s.tasks[taskID] = &Task{ID: taskID, Status: TaskAssigned, WorkerID: workerID, Attempts: 1, MaxRetries: 3}
+		s.mu.Unlock()
+	}
+
+	go s.MonitorWorkers(10 * time.Millisecond)
+	defer s.Stop()
+
+	addDeadWorkerWithTask("w2", "t2")
+	waitFor(t, "the first dead worker to be reaped", func() bool { return !workerKnown(s, "w2") })
+	waitFor(t, "t2 to be handed to the frozen worker (dispatch now stuck)", func() bool {
+		return taskWorker(s, "t2") == "w1"
+	})
+
+	// With a dispatch stuck in flight, another worker dies.
+	addDeadWorkerWithTask("w3", "t3")
+	waitFor(t, "the second dead worker to be reaped while a dispatch is stuck", func() bool {
+		return !workerKnown(s, "w3")
+	})
+}
+
+// TestLateDispatchErrorDoesNotDisturbReassignedTask covers what a
+// stuck dispatch does when it finally returns. The call to w1 hangs,
+// w1 is reaped, and the task is reassigned to w2. When w1's call then
+// fails, it must not requeue or redispatch a task that is already
+// running on w2.
+func TestLateDispatchErrorDoesNotDisturbReassignedTask(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan error)
+	var mu sync.Mutex
+	toW2 := 0
+	dispatch := func(workerID, addr string, task *Task) error {
+		if workerID == "w1" {
+			started <- struct{}{}
+			return <-release // the stuck call, failing late
+		}
+		mu.Lock()
+		toW2++
+		mu.Unlock()
+		return nil
+	}
+	s := NewScheduler(dispatch)
+	s.RegisterWorker("w1", "localhost:9001")
+
+	submitted := make(chan struct{})
+	go func() {
+		s.SubmitTask("t1", "payload") // blocks inside the dispatch to w1
+		close(submitted)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("setup: dispatch to w1 never started")
+	}
+
+	s.RegisterWorker("w2", "localhost:9002")
+	markWorkerDead(s, "w1")
+	s.reapDeadWorkers()
+	s.dispatchQueued() // t1 -> w2
+
+	if status, attempts := taskState(s, "t1"); status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w2" {
+		t.Fatalf("setup: expected t1 reassigned to w2 (attempt 2), got %s on %q (attempt %d)",
+			status, taskWorker(s, "t1"), attempts)
+	}
+
+	release <- errors.New("late failure") // w1's stuck call now errors out
+	select {
+	case <-submitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stuck dispatch never returned after it was released")
+	}
+
+	status, attempts := taskState(s, "t1")
+	if status != TaskAssigned || attempts != 2 || taskWorker(s, "t1") != "w2" {
+		t.Errorf("late error disturbed the reassigned task: %s on %q (attempt %d)", status, taskWorker(s, "t1"), attempts)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if toW2 != 1 {
+		t.Errorf("expected exactly 1 dispatch to w2, got %d (the late error caused a re-dispatch)", toW2)
+	}
+	if n := activeTaskCount(s, "w2"); n != 1 {
+		t.Errorf("expected w2 to hold exactly t1, got %d active task(s)", n)
+	}
+}
+
+// TestSweepAsyncRunsAgainForWorkAddedDuringSweep checks that a request
+// for a sweep made while one is already running is not lost: the
+// running sweep makes another pass and picks up the new task.
+func TestSweepAsyncRunsAgainForWorkAddedDuringSweep(t *testing.T) {
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var dispatched []string
+	dispatch := func(workerID, addr string, task *Task) error {
+		mu.Lock()
+		dispatched = append(dispatched, task.ID)
+		first := len(dispatched) == 1
+		mu.Unlock()
+		if first {
+			<-gate // keep the first sweep busy
+		}
+		return nil
+	}
+	s := NewScheduler(dispatch)
+	s.SubmitTask("t1", "payload") // no workers yet: stays queued
+	s.RegisterWorker("w1", "localhost:9001")
+
+	s.sweepAsync() // sweep 1 starts dispatching t1 and blocks on the gate
+	waitFor(t, "the first sweep to start dispatching", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(dispatched) >= 1
+	})
+
+	// New work arrives while that sweep is busy, and another sweep is
+	// requested. The request can't start a second sweep, but it must
+	// not be forgotten either.
+	s.mu.Lock()
+	s.nextSeq++
+	s.tasks["t2"] = &Task{ID: "t2", Status: TaskQueued, MaxRetries: 3, seq: s.nextSeq}
+	s.mu.Unlock()
+	s.sweepAsync()
+
+	close(gate)
+	waitFor(t, "the follow-up pass to dispatch t2", func() bool {
+		status, _ := taskState(s, "t2")
+		return status == TaskAssigned
+	})
 }
 
 func taskID(i int) string {
